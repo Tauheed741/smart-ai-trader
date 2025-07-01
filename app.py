@@ -15,7 +15,7 @@ from utils_log import (
 
 # ==== CONFIG ====
 st.set_page_config(page_title="📈 SMART AI TRADER", layout="wide")
-st.image("logo.png", width=150)
+st.image("logo.jpeg", width=150)
 st.title("📊 SMART AI TRADER - Global Market Intelligence")
 
 # ==== INPUTS ====
