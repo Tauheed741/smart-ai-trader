@@ -1,99 +1,123 @@
-import os
 import pandas as pd
-import numpy as np
 import requests
-from datetime import datetime
+import os
+import json
+from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
-import matplotlib.pyplot as plt
-import streamlit as st
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from streamlit import secrets
 
 LOG_FILE = "prediction_log.csv"
+COINGECKO_MAP = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "BNB": "binancecoin",
+    "SOL": "solana",
+    "XRP": "ripple"
+}
+
+def is_crypto(symbol):
+    return symbol.upper() in COINGECKO_MAP
 
 # === DATA FETCH ===
+
 def get_live_data(symbol, interval="1h"):
-    from streamlit import secrets
-    api_key = secrets["twelvedata"]["api_key"]
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=30&apikey={api_key}"
-    r = requests.get(url)
-    if "values" not in r.json():
-        st.warning("⚠️ Could not retrieve data. Please check symbol.")
-        return None
-    df = pd.DataFrame(r.json()["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df["close"] = pd.to_numeric(df["close"])
-    return df.sort_values("datetime")
+    symbol = symbol.upper()
+
+    if is_crypto(symbol):
+        try:
+            crypto_id = COINGECKO_MAP[symbol]
+            url = f"https://api.coingecko.com/api/v3/coins/{crypto_id}/market_chart?vs_currency=inr&days=2&interval=hourly"
+            r = requests.get(url)
+            data = r.json()
+
+            prices = data["prices"]
+            df = pd.DataFrame(prices, columns=["timestamp", "price"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
+            df.set_index("timestamp", inplace=True)
+            return df
+        except Exception as e:
+            print(f"[Error] CoinGecko fetch failed: {e}")
+            return None
+    else:
+        try:
+            api_key = secrets["twelvedata"]["api_key"]
+            url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={api_key}"
+            r = requests.get(url)
+            data = r.json()
+            if "values" not in data:
+                return None
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df.set_index("datetime", inplace=True)
+            df = df.rename(columns={"close": "price"})
+            df["price"] = df["price"].astype(float)
+            df.sort_index(inplace=True)
+            return df
+        except Exception as e:
+            print(f"[Error] TwelveData fetch failed: {e}")
+            return None
 
 # === ML PREDICTION ===
-def predict_stock(df):
-    df = df.copy()
-    df["timestamp"] = df["datetime"].astype(np.int64) // 10**9
-    X = df["timestamp"].values.reshape(-1, 1)
-    y = df["close"].values
-    model = LinearRegression().fit(X, y)
-    pred = model.predict([[X[-1][0] + 3600*24]])[0]
-    signal = int(pred > y[-1])  # Buy if predicted > current
-    confidence = abs((pred - y[-1]) / y[-1]) * 100
-    return signal, confidence
 
-def predict_price_range(df, days):
+def predict_stock(df, days=3):
     df = df.copy()
-    df["timestamp"] = df["datetime"].astype(np.int64) // 10**9
-    X = df["timestamp"].values.reshape(-1, 1)
-    y = df["close"].values
-    model = LinearRegression().fit(X, y)
-    future_ts = X[-1][0] + 3600*24*days
-    pred = model.predict([[future_ts]])[0]
-    low = pred * 0.97
-    high = pred * 1.03
-    return pred, low, high, model, y[-1]
+    df["timestamp"] = (df.index - df.index[0]).total_seconds()
+    df["day"] = df["timestamp"] / 86400
+    X = df["day"].values.reshape(-1, 1)
+    y = df["price"].values
+    model = LinearRegression()
+    model.fit(X, y)
+    future_days = max(df["day"]) + days
+    prediction = model.predict([[future_days]])[0]
+    confidence = model.score(X, y) * 100
+    return round(prediction, 2), round(confidence, 2)
 
-# === PLOT ===
-def plot_predictions(df, model):
-    df = df.copy()
-    df["timestamp"] = df["datetime"].astype(np.int64) // 10**9
-    X = df["timestamp"].values.reshape(-1, 1)
-    df["predicted"] = model.predict(X)
-    fig, ax = plt.subplots()
-    ax.plot(df["datetime"], df["close"], label="Actual")
-    ax.plot(df["datetime"], df["predicted"], label="Predicted")
-    ax.legend()
-    st.pyplot(fig)
+def predict_price_range(current, variation=1.5):
+    low = round(current - variation, 2)
+    high = round(current + variation, 2)
+    return low, high
 
 # === LOGGING ===
-def save_prediction_log(symbol=None, current_price=None, target_price=None, confidence=None, load=False):
-    if load:
-        if os.path.exists(LOG_FILE):
-            return pd.read_csv(LOG_FILE)
-        return pd.DataFrame(columns=["timestamp", "symbol", "name", "current_price", "target_price", "confidence", "is_new_listing"])
+
+def log_prediction(symbol, name, current_price, target_price, confidence, is_new_listing):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    name = "Unknown"
-    is_new_listing = "None"
-    new_entry = pd.DataFrame([{
+    row = {
         "timestamp": timestamp,
         "symbol": symbol,
         "name": name,
         "current_price": current_price,
         "target_price": target_price,
-        "confidence": round(confidence, 2),
+        "confidence": confidence,
         "is_new_listing": is_new_listing
-    }])
-    if os.path.exists(LOG_FILE):
-        old = pd.read_csv(LOG_FILE)
-        df = pd.concat([old, new_entry], ignore_index=True)
-    else:
-        df = new_entry
-    df.to_csv(LOG_FILE, index=False)
-    return df
+    }
 
-# === Bounce-Back Checker ===
-def show_bounce_back_opportunities():
+    if os.path.exists(LOG_FILE):
+        df = pd.read_csv(LOG_FILE)
+    else:
+        df = pd.DataFrame(columns=row.keys())
+
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(LOG_FILE, index=False)
+
+# === BOUNCE-BACK DETECTION ===
+
+def detect_bounce_back():
     if not os.path.exists(LOG_FILE):
-        st.info("No logs to analyze yet.")
-        return
+        return pd.DataFrame()
+
     df = pd.read_csv(LOG_FILE)
-    if df.empty:
-        st.info("Prediction log is empty.")
-        return
-    recent = df.sort_values("timestamp", ascending=False).head(10)
-    bounce = recent[recent["target_price"] > recent["current_price"] * 1.05]
-    st.dataframe(bounce, use_container_width=True)
+    df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
+    bounce_df = df[df["confidence"] > 75]
+    return bounce_df.tail(10)
+
+# === TOP STOCK SIGNALS ===
+
+def top_signals():
+    if not os.path.exists(LOG_FILE):
+        return pd.DataFrame()
+
+    df = pd.read_csv(LOG_FILE)
+    df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
+    df = df.sort_values(by="confidence", ascending=False)
+    return df.dropna(subset=["confidence"]).head(5)
