@@ -7,7 +7,7 @@ from utils_log import (
 st.set_page_config(page_title="SMART AI TRADER", layout="wide")
 
 # === Logo & Title ===
-st.image("logo.png", width=150)
+st.image("logo.jpg", width=150)
 st.title("📊 SMART AI TRADER - Global Market Intelligence")
 
 # === Symbol Input ===
