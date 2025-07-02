@@ -1,109 +1,99 @@
-# utils_log.py
 import os
 import pandas as pd
+import numpy as np
 import requests
 from datetime import datetime
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+import streamlit as st
 
-# === TELEGRAM ALERT ===
-def send_telegram_alert(symbol, current_price, target_price, confidence, direction):
-    token = st.secrets["telegram"]["bot_token"]
-    chat_id = st.secrets["telegram"]["chat_id"]
-    message = (
-        f"🚨 *ALERT* 🚨\n"
-        f"Symbol: {symbol}\n"
-        f"Signal: {'📈 BUY' if direction else '📉 SELL'}\n"
-        f"Current: ₹{current_price:.2f}\n"
-        f"Target: ₹{target_price:.2f}\n"
-        f"Confidence: {confidence:.2f}%"
-    )
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, data=data)
+LOG_FILE = "prediction_log.csv"
 
 # === DATA FETCH ===
 def get_live_data(symbol, interval="1h"):
     from streamlit import secrets
     api_key = secrets["twelvedata"]["api_key"]
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=100&apikey={api_key}"
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize=30&apikey={api_key}"
     r = requests.get(url)
     if "values" not in r.json():
+        st.warning("⚠️ Could not retrieve data. Please check symbol.")
         return None
     df = pd.DataFrame(r.json()["values"])
-    df = df.rename(columns={"datetime": "Date", "close": "Close", "open": "Open", "high": "High", "low": "Low", "volume": "Volume"})
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date")
-    df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
-    df["Return"] = df["Close"].pct_change()
-    df["Target"] = (df["Return"].shift(-1) > 0).astype(int)
-    df.dropna(inplace=True)
-    return df
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["close"] = pd.to_numeric(df["close"])
+    return df.sort_values("datetime")
 
-# === PREDICTIONS ===
+# === ML PREDICTION ===
 def predict_stock(df):
-    features = ["Open", "High", "Low", "Close", "Volume"]
-    model = RandomForestClassifier()
-    model.fit(df[features], df["Target"])
-    pred = model.predict([df[features].iloc[-1]])[0]
-    prob = model.predict_proba([df[features].iloc[-1]])[0][1]
-    return pred, round(prob * 100, 2)
+    df = df.copy()
+    df["timestamp"] = df["datetime"].astype(np.int64) // 10**9
+    X = df["timestamp"].values.reshape(-1, 1)
+    y = df["close"].values
+    model = LinearRegression().fit(X, y)
+    pred = model.predict([[X[-1][0] + 3600*24]])[0]
+    signal = int(pred > y[-1])  # Buy if predicted > current
+    confidence = abs((pred - y[-1]) / y[-1]) * 100
+    return signal, confidence
 
 def predict_price_range(df, days):
-    features = ["Open", "High", "Low", "Close", "Volume"]
-    df['Future_Close'] = df['Close'].shift(-days)
-    df.dropna(inplace=True)
-    X = df[features]
-    y = df['Future_Close']
-    model = RandomForestRegressor()
-    model.fit(X, y)
-    prediction = model.predict([df[features].iloc[-1]])[0]
-    current_price = df['Close'].iloc[-1]
-    std = df['Return'].std()
-    high = prediction * (1 + std * days)
-    low = prediction * (1 - std * days)
-    return prediction, low, high, model, current_price
+    df = df.copy()
+    df["timestamp"] = df["datetime"].astype(np.int64) // 10**9
+    X = df["timestamp"].values.reshape(-1, 1)
+    y = df["close"].values
+    model = LinearRegression().fit(X, y)
+    future_ts = X[-1][0] + 3600*24*days
+    pred = model.predict([[future_ts]])[0]
+    low = pred * 0.97
+    high = pred * 1.03
+    return pred, low, high, model, y[-1]
 
-def forecast_next_days(df, model, days):
-    features = ["Open", "High", "Low", "Close", "Volume"]
-    current = df.iloc[-1][features]
-    results = []
-    for _ in range(days):
-        pred = model.predict([current])[0]
-        results.append(pred)
-        current["Close"] = pred
-    return results
+# === PLOT ===
+def plot_predictions(df, model):
+    df = df.copy()
+    df["timestamp"] = df["datetime"].astype(np.int64) // 10**9
+    X = df["timestamp"].values.reshape(-1, 1)
+    df["predicted"] = model.predict(X)
+    fig, ax = plt.subplots()
+    ax.plot(df["datetime"], df["close"], label="Actual")
+    ax.plot(df["datetime"], df["predicted"], label="Predicted")
+    ax.legend()
+    st.pyplot(fig)
 
 # === LOGGING ===
-LOG_FILE = "prediction_log.csv"
-
-def update_prediction_log(symbol, current_price, target_price, confidence):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if not os.path.exists(LOG_FILE):
-        df = pd.DataFrame(columns=["Timestamp", "Symbol", "CurrentPrice", "TargetPrice", "Confidence"])
-    else:
-        df = pd.read_csv(LOG_FILE)
-
-    name = get_company_name_from_symbol(symbol)
-    new_entry = pd.DataFrame([[now, name, current_price, target_price, confidence]],
-                             columns=["Timestamp", "Symbol", "CurrentPrice", "TargetPrice", "Confidence"])
-    df = pd.concat([df, new_entry], ignore_index=True)
-    df.to_csv(LOG_FILE, index=False)
-
-def load_prediction_log():
+def save_prediction_log(symbol=None, current_price=None, target_price=None, confidence=None, load=False):
+    if load:
+        if os.path.exists(LOG_FILE):
+            return pd.read_csv(LOG_FILE)
+        return pd.DataFrame(columns=["timestamp", "symbol", "name", "current_price", "target_price", "confidence", "is_new_listing"])
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    name = "Unknown"
+    is_new_listing = "None"
+    new_entry = pd.DataFrame([{
+        "timestamp": timestamp,
+        "symbol": symbol,
+        "name": name,
+        "current_price": current_price,
+        "target_price": target_price,
+        "confidence": round(confidence, 2),
+        "is_new_listing": is_new_listing
+    }])
     if os.path.exists(LOG_FILE):
-        return pd.read_csv(LOG_FILE)
+        old = pd.read_csv(LOG_FILE)
+        df = pd.concat([old, new_entry], ignore_index=True)
     else:
-        return pd.DataFrame(columns=["Timestamp", "Symbol", "CurrentPrice", "TargetPrice", "Confidence"])
+        df = new_entry
+    df.to_csv(LOG_FILE, index=False)
+    return df
 
-def get_company_name_from_symbol(symbol):
-    return symbol.split(".")[0] if "." in symbol else symbol.split("/")[0]
-
-# === REBOUND CHECK ===
-def list_bounce_back_opportunities():
-    df = load_prediction_log()
+# === Bounce-Back Checker ===
+def show_bounce_back_opportunities():
+    if not os.path.exists(LOG_FILE):
+        st.info("No logs to analyze yet.")
+        return
+    df = pd.read_csv(LOG_FILE)
     if df.empty:
-        return pd.DataFrame()
-
-    df["Delta"] = df["TargetPrice"] - df["CurrentPrice"]
-    df["Direction"] = df["Delta"].apply(lambda x: "📈 Up" if x > 0 else "📉 Down")
-    return df.sort_values(by="Confidence", ascending=False).head(10)
+        st.info("Prediction log is empty.")
+        return
+    recent = df.sort_values("timestamp", ascending=False).head(10)
+    bounce = recent[recent["target_price"] > recent["current_price"] * 1.05]
+    st.dataframe(bounce, use_container_width=True)
