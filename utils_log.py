@@ -121,3 +121,4 @@ def top_signals():
     df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
     df = df.sort_values(by="confidence", ascending=False)
     return df.dropna(subset=["confidence"]).head(5)
+    
